@@ -4341,6 +4341,188 @@ mod tests {
         });
     }
 
+    /// Asserts the exact page an EVM caller observes, so these tests prove the ABI
+    /// contract rather than the shape of the underlying storage vector.
+    fn assert_staking_hotkeys_page(caller: H160, coldkey: &AccountId, expected: &[AccountId]) {
+        let words: Vec<H256> = expected
+            .iter()
+            .map(|hotkey| H256::from_slice(hotkey.as_ref()))
+            .collect();
+        let total = u64::try_from(expected.len()).expect("expected page fits in u64");
+
+        precompiles::<StakingPrecompileV2<Runtime>>()
+            .prepare_test(
+                caller,
+                addr_from_index(StakingPrecompileV2::<Runtime>::INDEX),
+                encode_with_selector(
+                    selector_u32("getStakingHotkeys(bytes32,uint64,uint16)"),
+                    (H256::from_slice(coldkey.as_ref()), 0_u64, 64_u16),
+                ),
+            )
+            .with_static_call(true)
+            .execute_returns((words, total));
+    }
+
+    fn dispatch_staking_v2(caller: H160, input: Vec<u8>) {
+        precompiles::<StakingPrecompileV2<Runtime>>()
+            .prepare_test(
+                caller,
+                addr_from_index(StakingPrecompileV2::<Runtime>::INDEX),
+                input,
+            )
+            .execute_returns(());
+    }
+
+    #[test]
+    fn staking_hotkeys_view_keeps_hotkeys_drained_by_remove_stake_full() {
+        new_test_ext().execute_with(|| {
+            let netuid = setup_staking_subnet();
+            let caller = addr_from_index(0x300a);
+            let coldkey = mapped_account(caller);
+            let drained = AccountId::from([0xa1; 32]);
+            let funded = AccountId::from([0xa2; 32]);
+
+            fund_account(&coldkey, COLDKEY_BALANCE);
+            add_stake_v2(caller, &drained, TEST_NETUID_U16, INITIAL_STAKE_RAO);
+            add_stake_v2(caller, &funded, TEST_NETUID_U16, INITIAL_STAKE_RAO);
+            assert!(stake_for(&drained, &coldkey, netuid) > 0);
+            assert_staking_hotkeys_page(caller, &coldkey, &[drained.clone(), funded.clone()]);
+
+            dispatch_staking_v2(
+                caller,
+                encode_with_selector(
+                    selector_u32("removeStakeFull(bytes32,uint256)"),
+                    (
+                        H256::from_slice(drained.as_ref()),
+                        U256::from(TEST_NETUID_U16),
+                    ),
+                ),
+            );
+
+            assert_eq!(stake_for(&drained, &coldkey, netuid), 0);
+            assert_staking_hotkeys_page(caller, &coldkey, &[drained, funded]);
+        });
+    }
+
+    #[test]
+    fn staking_hotkeys_view_keeps_hotkeys_drained_by_unstake_all() {
+        new_test_ext().execute_with(|| {
+            let netuid = setup_staking_subnet();
+            let second_netuid = setup_staking_subnet_id(SECOND_NETUID_U16);
+            let caller = addr_from_index(0x300b);
+            let coldkey = mapped_account(caller);
+            let drained = AccountId::from([0xb1; 32]);
+
+            fund_account(&coldkey, COLDKEY_BALANCE);
+            add_stake_v2(caller, &drained, TEST_NETUID_U16, INITIAL_STAKE_RAO);
+            add_stake_v2(caller, &drained, SECOND_NETUID_U16, INITIAL_STAKE_RAO);
+            assert!(stake_for(&drained, &coldkey, netuid) > 0);
+            assert!(stake_for(&drained, &coldkey, second_netuid) > 0);
+
+            dispatch_staking_v2(
+                caller,
+                encode_with_selector(
+                    selector_u32("unstakeAll(bytes32)"),
+                    H256::from_slice(drained.as_ref()),
+                ),
+            );
+
+            assert_eq!(stake_for(&drained, &coldkey, netuid), 0);
+            assert_eq!(stake_for(&drained, &coldkey, second_netuid), 0);
+            assert_staking_hotkeys_page(caller, &coldkey, &[drained]);
+        });
+    }
+
+    #[test]
+    fn staking_hotkeys_view_keeps_the_origin_hotkey_emptied_by_move_stake() {
+        new_test_ext().execute_with(|| {
+            let netuid = setup_staking_subnet();
+            let caller = addr_from_index(0x300c);
+            let coldkey = mapped_account(caller);
+            let origin = AccountId::from([0xc1; 32]);
+            let destination = AccountId::from([0xc2; 32]);
+
+            fund_account(&coldkey, COLDKEY_BALANCE);
+            add_stake_v2(caller, &origin, TEST_NETUID_U16, INITIAL_STAKE_RAO);
+            ensure_hotkey_exists(&destination);
+            let moved = stake_for(&origin, &coldkey, netuid);
+            assert!(moved > 0);
+
+            dispatch_staking_v2(
+                caller,
+                encode_with_selector(
+                    selector_u32("moveStake(bytes32,bytes32,uint256,uint256,uint256)"),
+                    (
+                        H256::from_slice(origin.as_ref()),
+                        H256::from_slice(destination.as_ref()),
+                        U256::from(TEST_NETUID_U16),
+                        U256::from(TEST_NETUID_U16),
+                        U256::from(moved),
+                    ),
+                ),
+            );
+
+            assert_eq!(stake_for(&origin, &coldkey, netuid), 0);
+            assert!(stake_for(&destination, &coldkey, netuid) > 0);
+            assert_staking_hotkeys_page(caller, &coldkey, &[origin, destination]);
+        });
+    }
+
+    #[test]
+    fn staking_hotkeys_view_keeps_hotkeys_emptied_by_transfer_stake() {
+        new_test_ext().execute_with(|| {
+            let netuid = setup_staking_subnet();
+            let caller = addr_from_index(0x300d);
+            let coldkey = mapped_account(caller);
+            let recipient = AccountId::from([0xd9; 32]);
+            let hotkey = AccountId::from([0xd1; 32]);
+
+            fund_account(&coldkey, COLDKEY_BALANCE);
+            add_stake_v2(caller, &hotkey, TEST_NETUID_U16, INITIAL_STAKE_RAO);
+            let transferred = stake_for(&hotkey, &coldkey, netuid);
+            assert!(transferred > 0);
+
+            dispatch_staking_v2(
+                caller,
+                encode_with_selector(
+                    selector_u32("transferStake(bytes32,bytes32,uint256,uint256,uint256)"),
+                    (
+                        H256::from_slice(recipient.as_ref()),
+                        H256::from_slice(hotkey.as_ref()),
+                        U256::from(TEST_NETUID_U16),
+                        U256::from(TEST_NETUID_U16),
+                        U256::from(transferred),
+                    ),
+                ),
+            );
+
+            assert_eq!(stake_for(&hotkey, &coldkey, netuid), 0);
+            assert!(stake_for(&hotkey, &recipient, netuid) > 0);
+            assert_staking_hotkeys_page(caller, &coldkey, &[hotkey.clone()]);
+            assert_staking_hotkeys_page(caller, &recipient, &[hotkey]);
+        });
+    }
+
+    #[test]
+    fn staking_hotkeys_view_returns_a_registered_hotkey_that_never_held_stake() {
+        new_test_ext().execute_with(|| {
+            let netuid = setup_staking_subnet();
+            let caller = addr_from_index(0x300e);
+            let coldkey = mapped_account(caller);
+            let never_staked = AccountId::from([0xe1; 32]);
+
+            // The path every registration extrinsic takes to bind a fresh hotkey.
+            pallet_subtensor::Pallet::<Runtime>::create_account_if_non_existent(
+                &coldkey,
+                &never_staked,
+            )
+            .expect("registering a fresh hotkey should succeed");
+
+            assert_eq!(stake_for(&never_staked, &coldkey, netuid), 0);
+            assert_staking_hotkeys_page(caller, &coldkey, &[never_staked]);
+        });
+    }
+
     #[test]
     fn staking_state_views_return_typed_values_and_missing_state() {
         new_test_ext().execute_with(|| {
